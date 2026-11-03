@@ -375,20 +375,14 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 	store.DeviceProps.Os = &cd.Instance.OsName
 	store.DeviceProps.RequireFullSync = proto.Bool(true)
 
+	versionSet := false
+
 	if w.config.WhatsappVersionMajor != 0 && w.config.WhatsappVersionMinor != 0 && w.config.WhatsappVersionPatch != 0 {
 		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version to %d.%d.%d", cd.Instance.Id, w.config.WhatsappVersionMajor, w.config.WhatsappVersionMinor, w.config.WhatsappVersionPatch)
 		version.Major = w.config.WhatsappVersionMajor
-		if err == nil {
-			store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
-		}
 		version.Minor = w.config.WhatsappVersionMinor
-		if err == nil {
-			store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
-		}
 		version.Patch = w.config.WhatsappVersionPatch
-		if err == nil {
-			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
-		}
+		versionSet = true
 	} else {
 		// Try to fetch version from WhatsApp Web
 		webVersion, err := fetchWhatsAppWebVersion()
@@ -397,10 +391,27 @@ func (w whatsmeowService) StartClient(cd *ClientData) {
 		} else {
 			w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Setting whatsapp version from web to %d.%d.%d", cd.Instance.Id, webVersion.Major, webVersion.Minor, webVersion.Patch)
 			version = *webVersion
-			store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
-			store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
-			store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
+			versionSet = true
 		}
+	}
+
+	if versionSet {
+		// Versão exibida no aparelho vinculado
+		store.DeviceProps.Version.Primary = proto.Uint32(uint32(version.Major))
+		store.DeviceProps.Version.Secondary = proto.Uint32(uint32(version.Minor))
+		store.DeviceProps.Version.Tertiary = proto.Uint32(uint32(version.Patch))
+
+		// Versão usada no handshake (global da whatsmeow). Sem isso o servidor responde 405 "Client outdated".
+		// SetWAVersion escreve em globais sem lock: serializa e só escreve se a versão mudou,
+		// evitando escritas redundantes quando várias instâncias iniciam ao mesmo tempo.
+		newWAVersion := store.WAVersionContainer{uint32(version.Major), uint32(version.Minor), uint32(version.Patch)}
+		waVersionMu.Lock()
+		if store.GetWAVersion() != newWAVersion {
+			store.SetWAVersion(newWAVersion)
+		}
+		effectiveVersion := store.GetWAVersion().String()
+		waVersionMu.Unlock()
+		w.loggerWrapper.GetLogger(cd.Instance.Id).LogInfo("[%s] Effective whatsapp version for handshake: %s", cd.Instance.Id, effectiveVersion)
 	}
 
 	// 🔒 FIX: Sempre criar logger, mesmo que WaDebug esteja vazio
@@ -2608,6 +2619,10 @@ var (
 	cachedWebVersionAt time.Time
 	cachedWebVersionMu sync.Mutex
 	webVersionCacheTTL = 1 * time.Hour
+
+	// waVersionMu serializa store.SetWAVersion, que escreve em variáveis globais da whatsmeow
+	// (sem lock próprio). Lock separado de cachedWebVersionMu: nunca é segurado durante o fetch.
+	waVersionMu sync.Mutex
 )
 
 func fetchWhatsAppWebVersion() (*clientVersion, error) {
